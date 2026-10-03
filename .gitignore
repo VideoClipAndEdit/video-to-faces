@@ -2,8 +2,14 @@ build/
 dist/
 *.egg-info/
 *.egg
+*.json
+*.png
+*.mp4
+*.mkv
 __pycache__/
+.idea/
 
 weights/
 datasets/
 videos/
+
