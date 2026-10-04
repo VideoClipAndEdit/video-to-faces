@@ -6,7 +6,7 @@ import torch
 from .download import url_download
 
 
-def load_weights(model, link, filename=None, extra_conversion=None, sub=None, add_num_batches=False, jit=False):
+def load_weights(model, link, filename=None, extra_conversion=None, sub=None, add_num_batches=False):
     """A common all-in-one function for loading pretrained weights from various sources into a model.
     Automatically downloads from ``link`` and saves is as "weights/``filename``.pt", then reads the
     weights dictionary (wd) from it and copies into the model's dictionary following the same order
@@ -22,12 +22,7 @@ def load_weights(model, link, filename=None, extra_conversion=None, sub=None, ad
     fn = '%s.pt' % (filename or model.__class__.__name__.lower())
     wf = prep_file(link, fn)
     dv = torch.device(next(model.parameters()).device)
-    if not jit:
-        wd_src = torch.load(wf, map_location=dv)
-        #for debugging, print all weights with their shapes using this:
-        #for w in model.state_dict(): print(w, '\t', model.state_dict()[w].shape)
-    else:
-        wd_src = torch.jit.load(wf, map_location=dv).eval().state_dict()
+    wd_src = torch.load(wf, map_location=dv, weights_only=True)
     if sub:
         wd_src = wd_src[sub]
     if extra_conversion:

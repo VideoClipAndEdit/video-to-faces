@@ -6,6 +6,7 @@ dist/
 *.png
 *.mp4
 *.mkv
+
 __pycache__/
 .idea/
 

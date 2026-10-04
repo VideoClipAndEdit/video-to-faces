@@ -11,7 +11,7 @@ import numpy as np
 
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.mov', '.avi', '.webm')
 REPORT_FIELDS = ('frame', 'time_sec', 'status', 'detection_score',
-                 'hair_distance', 'eye_distance', 'embedding_distance', 'reference')
+                 'hair_distance', 'embedding_distance', 'reference')
 HEAD_SCALE = (1.6, 1.6, 2.3, 1.15)
 
 
@@ -57,43 +57,29 @@ def _slice_box(image, box):
     return image[y1:y2, x1:x2]
 
 
-def _appearance(image, face_box, head_box):
-    """Return head crop and color cues, independent of source image size."""
+def _face_crop(image, box):
+    x1, y1, x2, y2 = (int(value) for value in box[:4])
+    # The detector's lower edge can include neck and clothing.
+    return image[y1:y1 + int(0.75 * (y2 - y1)), x1:x2]
+
+
+def _appearance(image, head_box):
+    """Return the head crop and its size-normalized hair color."""
     head = _slice_box(image, head_box)
     if head.size == 0:
-        return head, None, None
+        return head, None
     h, w = head.shape[:2]
     hair = head[:max(1, int(0.42 * h)), int(0.16 * w):max(1, int(0.84 * w))]
-    hair_color = _color_cue(hair, 'hair')
-
-    x1, y1, x2, y2 = (int(value) for value in face_box[:4])
-    fw, fh = x2 - x1, y2 - y1
-    eye_color = None
-    if fw >= 35 and fh >= 35:
-        image_h, image_w = image.shape[:2]
-        ex1 = max(0, x1 + int(0.08 * fw))
-        ex2 = min(image_w, x1 + int(0.92 * fw))
-        ey1 = max(0, y1 + int(0.20 * fh))
-        ey2 = min(image_h, y1 + int(0.62 * fh))
-        eye_region = image[ey1:ey2, ex1:ex2]
-        eye_color = _color_cue(eye_region, 'eye')
-    return head, hair_color, eye_color
+    return head, _hair_color(hair)
 
 
-def _color_cue(region, kind):
+def _hair_color(region):
     if region.size == 0:
         return None
     pixels = region.reshape(-1, 3).astype(np.float32)
     brightness = pixels.mean(axis=1)
-    if kind == 'hair':
-        cutoff = max(35.0, float(np.quantile(brightness, 0.45)))
-        selected = pixels[brightness >= cutoff]
-    else:
-        high = pixels.max(axis=1)
-        low = pixels.min(axis=1)
-        saturation = (high - low) / np.maximum(high, 1)
-        selected = pixels[(saturation >= 0.22) & (brightness >= 25) &
-                          (brightness <= 180)]
+    cutoff = max(35.0, float(np.quantile(brightness, 0.45)))
+    selected = pixels[brightness >= cutoff]
     if len(selected) < max(6, int(0.005 * len(pixels))):
         return None
     return np.median(selected, axis=0)
@@ -118,26 +104,20 @@ def _cosine_distance(a, b):
     return 2.0 if length == 0 else 1.0 - float(np.dot(a, b)) / length
 
 
-def _compare(head, references, limits):
-    """Hair and visible-eye color gate the embedding match."""
-    embedding, hair, eye = head
-    hair_limit, eye_limit, embedding_limit = limits
+def _compare(candidate, references, limits):
+    """Hair color takes priority over the supporting embedding match."""
+    embedding, hair = candidate
+    hair_limit, embedding_limit = limits
     choices = []
-    for name, ref_embedding, ref_hair, ref_eye in references:
+    for name, ref_embedding, ref_hair in references:
         hair_distance = _color_distance(hair, ref_hair)
-        eye_distance = _color_distance(eye, ref_eye)
         embedding_distance = _cosine_distance(embedding, ref_embedding)
         if hair_distance is None:
             continue
-        if eye_distance is None:
-            score = 0.70 * hair_distance + 0.30 * embedding_distance
-        else:
-            score = 0.50 * hair_distance + 0.30 * eye_distance + 0.20 * embedding_distance
+        score = 0.70 * hair_distance + 0.30 * embedding_distance
         confirmed = (hair_distance <= hair_limit and
-                     (eye_distance is None or eye_distance <= eye_limit) and
                      embedding_distance <= embedding_limit)
-        choices.append((not confirmed, score, name, hair_distance, eye_distance,
-                        embedding_distance))
+        choices.append((not confirmed, score, name, hair_distance, embedding_distance))
     if not choices:
         return 'uncertain', None
     choice = min(choices)
@@ -167,21 +147,22 @@ def _load_references(paths, detector, encoder, cv2, filter_boxes, adjust_boxes,
             raise ValueError('cannot read reference image: %s' % path)
         images.append(image)
     found = _face_heads(images, detector, filter_boxes, adjust_boxes, min_face_size)
-    heads = []
+    crops = []
     colors = []
     for path, image, pairs in zip(paths, images, found):
         pairs.sort(key=lambda pair: pair[0][4], reverse=True)
         if not pairs or (len(pairs) > 1 and pairs[1][0][4] >= pairs[0][0][4] - 0.1):
             raise ValueError('reference must contain one clear detected head: %s' % path)
-        head, hair, eye = _appearance(image, *pairs[0])
-        if head.size == 0 or hair is None:
+        head, hair = _appearance(image, pairs[0][1])
+        face = _face_crop(image, pairs[0][0])
+        if head.size == 0 or face.size == 0 or hair is None:
             raise ValueError('cannot assess head and hair in reference: %s' % path)
-        heads.append(head)
-        colors.append((path.name, hair, eye))
-    embeddings = encoder(heads)
-    if len(embeddings) != len(heads):
+        crops.append(face)
+        colors.append((path.name, hair))
+    embeddings = encoder(crops)
+    if len(embeddings) != len(crops):
         raise ValueError('encoder returned the wrong number of references')
-    return [(name, embedding, hair, eye) for (name, hair, eye), embedding
+    return [(name, embedding, hair) for (name, hair), embedding
             in zip(colors, embeddings)]
 
 
@@ -193,33 +174,32 @@ def _report_batch(frames, indexes, times, detector, encoder, references, limits,
     owners = []
     for frame_index, (frame, pairs) in enumerate(zip(frames, found)):
         for face, head_box in pairs:
-            crop, hair, eye = _appearance(frame, face, head_box)
-            if crop.size and hair is not None:
-                crops.append(crop)
-                cues.append((hair, eye, face[4]))
+            head, hair = _appearance(frame, head_box)
+            face_crop = _face_crop(frame, face)
+            if head.size and face_crop.size and hair is not None:
+                crops.append(face_crop)
+                cues.append((hair, face[4]))
                 owners.append(frame_index)
     embeddings = encoder(crops) if crops else []
     if len(embeddings) != len(crops):
         raise ValueError('encoder returned the wrong number of faces')
     candidates = [[] for _ in frames]
-    for owner, (hair, eye, detection_score), embedding in zip(owners, cues, embeddings):
-        status, choice = _compare((embedding, hair, eye), references, limits)
+    for owner, (hair, detection_score), embedding in zip(owners, cues, embeddings):
+        status, choice = _compare((embedding, hair), references, limits)
         if choice is not None:
             candidates[owner].append((status, choice, detection_score))
     rows = []
     for frame_index, time_sec, frame_candidates, pairs in zip(indexes, times, candidates, found):
         row = [frame_index, '%.6f' % time_sec, 'absent' if not pairs else 'uncertain',
-               '', '', '', '', '']
+               '', '', '', '']
         if frame_candidates:
             status, choice, detection_score = min(
                 frame_candidates, key=lambda item: (item[0] != 'confirmed', item[1][1]))
-            _, _, name, hair_distance, eye_distance, embedding_distance = choice
+            _, _, name, hair_distance, embedding_distance = choice
             if name.lstrip().startswith(('=', '+', '-', '@')):
                 name = "'" + name
             row = [frame_index, '%.6f' % time_sec, status, '%.4f' % detection_score,
-                   '%.4f' % hair_distance,
-                   '' if eye_distance is None else '%.4f' % eye_distance,
-                   '%.4f' % embedding_distance, name]
+                   '%.4f' % hair_distance, '%.4f' % embedding_distance, name]
         rows.append(row)
     return rows
 
@@ -273,49 +253,26 @@ def _scan_episode(path, report_path, detector, encoder, references, limits, batc
     return count, confirmed
 
 
-def _get_head_encoder(device):
-    """Use a maintained pretrained model for head comparison."""
-    import cv2
-    import torch
-    from torchvision.models import ResNet18_Weights, resnet18
-
-    target = torch.device(device or ('cuda:0' if torch.cuda.is_available() else 'cpu'))
-    model = resnet18(weights=ResNet18_Weights.DEFAULT).to(target).eval()
-    model.fc = torch.nn.Identity()
-    mean = torch.tensor((0.485, 0.456, 0.406), device=target)[None, :, None, None]
-    std = torch.tensor((0.229, 0.224, 0.225), device=target)[None, :, None, None]
-
-    def encode(images):
-        if not images:
-            return np.empty((0, 512), dtype=np.float32)
-        blob = cv2.dnn.blobFromImages(images, 1 / 255, (224, 224),
-                                      swapRB=True, crop=False)
-        batch = (torch.from_numpy(blob).to(target) - mean) / std
-        with torch.inference_mode():
-            return model(batch).cpu().numpy()
-
-    return encode
-
-
 def find_character(series_dir, character, device=None, batch_size=4, min_face_size=18,
-                   hair_threshold=0.20, eye_threshold=0.20, embedding_threshold=0.20):
+                   hair_threshold=0.20, embedding_threshold=0.90):
     """Write one frame-level ``matches.csv`` per episode; clips are a later phase."""
     if batch_size < 1 or min_face_size < 1:
         raise ValueError('batch_size and min_face_size must be positive')
-    if not 0 <= hair_threshold <= 1 or not 0 <= eye_threshold <= 1 or not 0 <= embedding_threshold <= 2:
+    if not 0 <= hair_threshold <= 1 or not 0 <= embedding_threshold <= 2:
         raise ValueError('invalid matching threshold')
     from .prep import IMG_EXTENSIONS
     episodes, paths, output_dir = _layout(series_dir, character, IMG_EXTENSIONS)
     import cv2
     from .detection import get_detector_model, filter_boxes, adjust_boxes
+    from .grouping import get_encoder_model
 
     detector = get_detector_model('anime', 'rcnn', device)
-    encoder = _get_head_encoder(device)
+    encoder = get_encoder_model('anime', 'default', device)
     references = _load_references(paths, detector, encoder, cv2, filter_boxes,
                                   adjust_boxes, min_face_size)
     output_dir.mkdir(parents=True, exist_ok=True)
     reports = []
-    limits = (hair_threshold, eye_threshold, embedding_threshold)
+    limits = (hair_threshold, embedding_threshold)
     for episode in episodes:
         report_dir = output_dir / episode.stem
         report_dir.mkdir(exist_ok=True)
@@ -338,8 +295,7 @@ def main():
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--min-face-size', type=int, default=18)
     parser.add_argument('--hair-threshold', type=float, default=0.20)
-    parser.add_argument('--eye-threshold', type=float, default=0.20)
-    parser.add_argument('--embedding-threshold', type=float, default=0.20)
+    parser.add_argument('--embedding-threshold', type=float, default=0.90)
     args = parser.parse_args()
     try:
         find_character(**vars(args))
