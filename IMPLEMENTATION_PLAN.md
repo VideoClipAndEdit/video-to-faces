@@ -25,7 +25,7 @@ anime/
 
 Adding another character means adding another folder under the series' `reference/`. Adding another anime means adding another folder under `anime/`. Episodes are shared among characters of the same anime.
 
-The `hunterxhunter` folders and both Killua reference images are present. Episode and clip filenames above illustrate where future media will go; no episodes have been added.
+The `hunterxhunter` folders, both Killua reference images, and one MP4 episode are present. Clip filenames above illustrate future output.
 
 ## 2. Non-Goals
 
@@ -88,7 +88,8 @@ Avoid creating:
 
 ### Phase 1: Find Character Appearances
 
-**Status:** Not Started  
+**Status:** In Progress
+
 **Depends on:** None
 
 #### Goal
@@ -141,9 +142,22 @@ Produce per-episode match timestamps and scores for a named character from the p
 
 - Inspect all input/output path handling and confirm no untrusted string enters a shell.
 
+#### Execution Notes
+
+- Added `src/videotofaces/character.py` with a Python entry point and `python -m videotofaces.character` CLI. It writes one per-frame `matches.csv` for each episode and reports when an episode has no confirmed matches.
+- Five focused tests pass, including both supplied references, resized heads, color-priority decisions, safe paths, and a leave/return frame sequence. Syntax compilation, CLI help, layout validation, and `git diff --check` pass.
+- The current Python environment lacks OpenCV and Torch, and no model weights are present. Real-model recognition on the episode and partial/back-of-head coverage remain unverified; those results may require threshold or candidate-detection adjustments during review.
+
+#### Review Notes
+
+- The five focused tests pass locally, but `tests/test_character.py` reads `killua1.png` and `killua2.png`. Both are ignored by `.gitignore` and absent from `git ls-files`, so the test suite is not reproducible from a clean checkout.
+- `PYTHONPATH=src python3 -m videotofaces.character --help` fails because OpenCV is missing; Torch and model weights are also absent. Reference detection and a full per-frame report for the supplied episode were not validated.
+- No security issue was found in the Phase 1 changes. Recheck the actual head/face detector's coverage of the supplied references and profile/back-of-head frames before another review.
+
 ### Phase 2: Export Clips and Document Use
 
-**Status:** Not Started  
+**Status:** Not Started
+
 **Depends on:** Phase 1
 
 #### Goal
